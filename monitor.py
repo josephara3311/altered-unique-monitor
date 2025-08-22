@@ -9,8 +9,6 @@ IFTTT_KEY     = os.getenv("IFTTT_KEY")
 IFTTT_EVENT   = os.getenv("IFTTT_EVENT", "altered_min_price")
 POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "60"))
 USER_AGENT    = os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari")
-LOGIN_EMAIL   = os.getenv("LOGIN_EMAIL")
-LOGIN_PASSWORD= os.getenv("LOGIN_PASSWORD")
 
 best_seen_price = math.inf
 best_seen_title = None
@@ -49,66 +47,14 @@ def find_min_price_card(page):
             min_price, min_title = price, title_guess
     return (None, None) if min_price == math.inf else (min_title, min_price)
 
-def login_if_needed(page):
-    print("[AUTH] Vérification de connexion…", flush=True)
-    page.goto(TARGET_URL, timeout=30000)
-    if page.get_by_text(re.compile(r"ACHETER", re.I)).count() > 0:
-        print("[AUTH] Déjà connecté.", flush=True); return
-    if not LOGIN_EMAIL or not LOGIN_PASSWORD:
-        raise RuntimeError("LOGIN_EMAIL / LOGIN_PASSWORD manquants (Render → Environment).")
-
-    # Essayer d’accéder au formulaire
-    for sel in [
-        "text=Se connecter", "text=Connexion", "text=Login",
-        'role=link[name="Se connecter"]', 'role=button[name="Se connecter"]'
-    ]:
-        try:
-            if page.locator(sel).count():
-                page.locator(sel).first.click()
-                page.wait_for_load_state("networkidle", timeout=15000)
-                break
-        except: pass
-
-    print("[AUTH] Tentative de login…", flush=True)
-    email_sels = ['input[name="email"]','input[type="email"]','input[name="username"]']
-    pwd_sels   = ['input[name="password"]','input[type="password"]']
-    filled = False
-    for e in email_sels:
-        for p in pwd_sels:
-            try:
-                if page.locator(e).count() and page.locator(p).count():
-                    page.fill(e, LOGIN_EMAIL)
-                    page.fill(p, LOGIN_PASSWORD)
-                    if page.get_by_role("button", name=re.compile("Se connecter|Connexion|Login|Sign in", re.I)).count():
-                        page.get_by_role("button", name=re.compile("Se connecter|Connexion|Login|Sign in", re.I)).first.click()
-                    else:
-                        page.keyboard.press("Enter")
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    filled = True
-                    break
-            except: pass
-        if filled: break
-    if not filled:
-        raise RuntimeError("Impossible de trouver le formulaire de connexion.")
-
-    page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
-    print("[AUTH] Connecté, sur la page du marché.", flush=True)
-
 def main():
     global best_seen_price, best_seen_title
     print("[START] boot worker", flush=True)
     with sync_playwright() as p:
         print("[PLAYWRIGHT] starting chromium…", flush=True)
         browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        context = browser.new_context(user_agent=USER_AGENT, locale="fr-FR")
+        context = browser.new_context(user_agent=USER_AGENT, locale="fr-FR", storage_state="storage_state.json")
         page = context.new_page()
-
-        try:
-            login_if_needed(page)
-        except Exception as e:
-            print(f"[AUTH][ERR] {e}\n{traceback.format_exc()}", flush=True)
-            time.sleep(30)
-            return
 
         while True:
             try:
@@ -128,6 +74,10 @@ def main():
             except Exception as e:
                 print(f"[ERR] Boucle: {e}\n{traceback.format_exc()}", flush=True)
             time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
