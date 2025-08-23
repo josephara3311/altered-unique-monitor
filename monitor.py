@@ -1,7 +1,7 @@
 # monitor.py
 import os, re, math, asyncio, traceback, requests
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # --------- Config (via variables d'env Render) ----------
@@ -17,13 +17,17 @@ STATE_PATH   = os.getenv("STORAGE_STATE_PATH", "/etc/secrets/storage_state.json"
 REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))
 WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "15000"))
 MAX_GOTO_RETRIES = int(os.getenv("MAX_GOTO_RETRIES", "3"))
-MAX_SCAN_ITEMS = int(os.getenv("MAX_SCAN_ITEMS", "300"))  # garde-fou
+
+# Nouveaux gardes-fous pour l’auto-scroll
+MAX_SCROLL_STEPS   = int(os.getenv("MAX_SCROLL_STEPS", "30"))   # nb max de scrolls supplémentaires
+SCROLL_PAUSE_MS    = int(os.getenv("SCROLL_PAUSE_MS", "800"))   # pause entre scrolls (ms)
+NO_GROWTH_RETRIES  = int(os.getenv("NO_GROWTH_RETRIES", "3"))   # scrolls autorisés sans apparition de nouvelles tuiles
 # -------------------------------------------------------
 
 best_seen_price = math.inf
 best_seen_title = None
 
-FOILER_RE = re.compile(r"\bfoiler\b", re.I)
+FOILER_RE = re.compile(r"\b(foiler|qr\s*code|code\s*qr|foil)\b", re.I)
 PRICE_RE  = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", re.I)
 
 def log(msg: str):
@@ -77,11 +81,49 @@ async def goto_with_retries(page, url: str) -> bool:
     log(f"[NAV][ERR] Échec de navigation après {MAX_GOTO_RETRIES} tentatives : {last_exc}")
     return False
 
-async def extract_title_and_price(item) -> Optional[Dict]:
-    """
-    Renvoie {title, price, url} pour un bloc; None si prix non parsé.
-    Le titre est déduit d'éléments dédiés, sinon heuristique du texte.
-    """
+# ---------- Détection "Foiler" multi-signaux ----------
+async def is_foiler_block(item) -> bool:
+    try:
+        txt = (await item.inner_text()).replace("\xa0"," ").replace("\u202f"," ")
+    except Exception:
+        txt = ""
+    if FOILER_RE.search(txt):
+        return True
+    try:
+        if await item.locator("text=/foiler/i").count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        # attributs et classes
+        for sel in ["*", "img", "svg", "[role=img]", "[aria-label]", "[title]"]:
+            loc = item.locator(sel)
+            n = min(await loc.count(), 6)
+            for i in range(n):
+                el = loc.nth(i)
+                for attr in ["aria-label", "title", "alt"]:
+                    v = await el.get_attribute(attr)
+                    if v and FOILER_RE.search(v):
+                        return True
+                cls = await el.get_attribute("class")
+                if cls and "foiler" in cls.lower():
+                    return True
+    except Exception:
+        pass
+    try:
+        # hrefs
+        links = item.locator("a")
+        n = await links.count()
+        for i in range(min(n, 8)):
+            href = await links.nth(i).get_attribute("href") or ""
+            if FOILER_RE.search(href):
+                return True
+    except Exception:
+        pass
+    return False
+
+# ---------- Récupère {title, price, url} pour une tuile ----------
+async def extract_card_data(item) -> Optional[Dict]:
     try:
         txt = await item.inner_text()
     except PWTimeout:
@@ -109,7 +151,7 @@ async def extract_title_and_price(item) -> Optional[Dict]:
             "Carte unique"
         )
 
-    # URL (si lien plausible trouvé, sinon liste)
+    # URL (si on trouve un lien "détail" plausible, sinon URL liste)
     url = TARGET_URL
     try:
         links = item.locator("a")
@@ -119,7 +161,6 @@ async def extract_title_and_price(item) -> Optional[Dict]:
             if not href:
                 continue
             low = href.lower()
-            # on prend un lien qui n'est pas "market" ni "foiler" si dispo
             if ("market" not in low) and ("foiler" not in low):
                 if href.startswith("http"):
                     url = href
@@ -132,65 +173,115 @@ async def extract_title_and_price(item) -> Optional[Dict]:
 
     return {"title": title, "price": price, "url": url}
 
-async def find_first_non_foiler(page) -> Optional[Dict]:
+# ---------- Parcours avec auto-scroll : trouver 2 cartes non-Foiler ----------
+async def pick_two_non_foiler_with_scroll(page) -> List[Dict]:
     """
-    Parcourt la liste dans l'ordre et retourne la 1ʳᵉ carte dont le TITRE
-    ne contient pas 'Foiler' (insensible à la casse). Ignore tout le reste.
+    Ne retient que les tuiles de premier niveau: elles doivent contenir
+    - 'À PARTIR DE'
+    - ET un bouton 'ACCÉDER AU DÉTAIL' (exclut les lignes 'offre' internes).
+    On scrolle progressivement tant qu'on n'a pas trouvé 2 non-Foiler.
     """
-    containers = page.locator("article, li, div").filter(
-        has_text=re.compile(r"\bACHETER\b", re.I)
-    ).filter(
-        has_text=re.compile(r"À\s*PARTIR\s*DE", re.I)
-    )
+    detail_btn = page.get_by_text(re.compile(r"ACCÉDER AU DÉTAIL", re.I))
 
+    def build_locator():
+        return page.locator("article, li, div").filter(
+            has_text=re.compile(r"À\s*PARTIR\s*DE", re.I)
+        ).filter(
+            has=detail_btn
+        )
+
+    containers = build_locator()
     total = await containers.count()
-    log(f"[SCRAPE] Blocs candidats (ACHETER + À PARTIR DE) : {total}")
+    log(f"[SCRAPE] Tuiles candidates (badge + bouton DÉTAIL) : {total}")
 
+    selected: List[Dict] = []
+    i = 0
+    last_total = total
+    no_growth = 0
     leading_foiler = 0
-    checked = 0
+    first_seen = True
 
-    for i in range(min(total, MAX_SCAN_ITEMS)):
-        item = containers.nth(i)
-        data = await extract_title_and_price(item)
-        checked += 1
+    while len(selected) < 2:
+        # Parcourir ce qui est déjà chargé
+        while i < total and len(selected) < 2:
+            item = containers.nth(i)
 
-        if not data:
-            # prix non parsé → on ignore silencieusement
-            continue
+            # première tuile => log de sécu
+            if first_seen:
+                first_is_foiler = await is_foiler_block(item)
+                if first_is_foiler:
+                    log("[CHECK] Première tuile visible = Foiler/QR → ignorée.")
+                    leading_foiler += 1
+                else:
+                    log("[CHECK] Première tuile visible = OK (non-Foiler).")
+                first_seen = False
 
-        title = data["title"] or ""
-        if FOILER_RE.search(title):
-            if leading_foiler == i:  # toujours en tête
-                leading_foiler += 1
-            log(f"[FILTER] Ligne {i}: titre = '{title}' → Foiler → ignorée.")
-            continue
-
-        # sécurité supplémentaire : si le bloc contient explicitement "Foiler" dans son texte
-        try:
-            if await item.locator("text=/foiler/i").count() > 0:
+            # Skip Foiler
+            if await is_foiler_block(item):
                 if leading_foiler == i:
                     leading_foiler += 1
-                log(f"[FILTER] Ligne {i}: sous-élément 'Foiler' détecté → ignorée.")
+                log(f"[FILTER] Tuile {i}: Foiler/QR → ignorée.")
+                i += 1
                 continue
-        except Exception:
-            pass
 
-        # On a trouvé la 1ʳᵉ carte non-Foiler
-        log(f"[CHECK] Première non-Foiler trouvée à la ligne {i} : {data['price']:.2f} € — {data['title']} — {data['url']}")
-        if leading_foiler:
-            log(f"[INFO] Foiler en tête de liste ignorés : {leading_foiler}")
-        return data
+            # Extraire données
+            data = await extract_card_data(item)
+            if not data:
+                # prix non parsé
+                i += 1
+                continue
+
+            selected.append(data)
+            log(f"[PICK] #{len(selected)} → {data['price']:.2f} € — {data['title']} — {data['url']}")
+            i += 1
+
+        if len(selected) >= 2:
+            break
+
+        # Auto-scroll pour charger plus de tuiles
+        if no_growth >= NO_GROWTH_RETRIES or (i >= total and (i > 0) and (no_growth >= NO_GROWTH_RETRIES)):
+            log("[SCROLL][STOP] Plus de croissance détectée, on s'arrête.")
+            break
+
+        # Scroll d'un écran vers le bas
+        await page.evaluate("window.scrollBy(0, Math.max(window.innerHeight, 800))")
+        await page.wait_for_timeout(SCROLL_PAUSE_MS)
+
+        # Mise à jour du locator (DOM évolutif)
+        containers = build_locator()
+        total = await containers.count()
+
+        if total > last_total:
+            log(f"[SCROLL] Nouvelles tuiles chargées : {last_total} → {total}")
+            last_total = total
+            no_growth = 0
+        else:
+            no_growth += 1
+            log(f"[SCROLL] Pas de nouvelles tuiles (essai {no_growth}/{NO_GROWTH_RETRIES}).")
+
+        # garde-fou global
+        MAX_SCROLL_STEPS_local = MAX_SCROLL_STEPS
+        MAX_SCROLL_STEPS_local -= 1
+        if MAX_SCROLL_STEPS_local <= 0:
+            log("[SCROLL][STOP] MAX_SCROLL_STEPS atteint.")
+            break
 
     if leading_foiler:
         log(f"[INFO] Foiler en tête de liste ignorés : {leading_foiler}")
-    log(f"[INFO] Aucune carte non-Foiler trouvée après examen de {checked} blocs.")
-    return None
+    log(f"[INFO] Cartes retenues (non-Foiler) : {len(selected)} / 2")
+    return selected
+
+def min_from_selected(cards: List[Dict]) -> Tuple[Optional[Dict], Optional[float]]:
+    if not cards:
+        return None, None
+    best = min(cards, key=lambda c: c["price"])
+    return best, best["price"]
 
 # ------------------------- MAIN LOOP -------------------------
 async def main():
     global best_seen_price, best_seen_title
 
-    log("[BOOT] Surveillance Altered marketplace (1ʳᵉ carte non-Foiler)")
+    log("[BOOT] Surveillance Altered marketplace (2 premières cartes non-Foiler avec auto-scroll)")
 
     if not os.path.exists(STATE_PATH):
         log(f"[AUTH][ERR] Fichier de session introuvable : {STATE_PATH}")
@@ -228,27 +319,31 @@ async def main():
                     await asyncio.sleep(max(POLL_SECONDS, 60))
                     continue
 
+                # petit scroll initial pour déclencher lazy-load
                 try:
-                    await page.evaluate("window.scrollTo(0, 600)")
+                    await page.evaluate("window.scrollTo(0, 400)")
                 except Exception:
                     pass
 
-                card = await find_first_non_foiler(page)
+                selected = await pick_two_non_foiler_with_scroll(page)
 
-                if not card:
-                    log("[INFO] Pas de carte valide détectée sur cette itération.")
+                if selected:
+                    for i, c in enumerate(selected, 1):
+                        log(f"[TOP{i}] {c['price']:.2f} € — {c['title']} — {c['url']}")
                 else:
-                    price = card["price"]
-                    title = card["title"]
-                    url = card["url"]
-                    log(f"[INFO] Min courant (1ʳᵉ non-Foiler): {price:.2f} € — {title} — {url}")
+                    log("[TOP2] Aucune carte non-Foiler trouvée (même après scroll).")
 
-                    # Alerte uniquement si nouveau plus bas
-                    if (best_seen_price is math.inf) or (price < best_seen_price - 1e-9):
-                        log(f"[ALERT] Nouveau plus bas {price:.2f} € "
+                best_card, min_price = min_from_selected(selected)
+                if not best_card:
+                    log("[INFO] Aucune vraie carte trouvée.")
+                else:
+                    log(f"[INFO] Min courant (sur {len(selected)} carte(s)) : {min_price:.2f} € — "
+                        f"{best_card['title']} — {best_card['url']}")
+                    if (best_seen_price is math.inf) or (min_price < best_seen_price - 1e-9):
+                        log(f"[ALERT] Nouveau plus bas {min_price:.2f} € "
                             f"(ancien {best_seen_price if best_seen_price < math.inf else '∞'})")
-                        send_ifttt(title or "Carte unique", price, url)
-                        best_seen_price, best_seen_title = price, title
+                        send_ifttt(best_card['title'] or "Carte unique", min_price, best_card['url'])
+                        best_seen_price, best_seen_title = min_price, best_card['title']
 
             except PWTimeout:
                 log("[WARN] Timeout d'action Playwright (goto / selector).")
@@ -259,6 +354,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
