@@ -1,5 +1,5 @@
 # monitor.py
-import os, re, math, asyncio, traceback, requests
+import os, re, math, json, asyncio, traceback, requests
 from datetime import datetime
 from typing import Optional, Dict
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -10,21 +10,26 @@ IFTTT_KEY    = os.getenv("IFTTT_KEY", "")
 IFTTT_EVENT  = os.getenv("IFTTT_EVENT", "altered_min_price")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 USER_AGENT   = os.getenv("USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 STATE_PATH   = os.getenv("STORAGE_STATE_PATH", "/etc/secrets/storage_state.json")
-REQUEST_TIMEOUT_MS    = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))
-WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "15000"))
+
+REQUEST_TIMEOUT_MS    = int(os.getenv("REQUEST_TIMEOUT_MS", "45000"))
+WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "25000"))
 MAX_GOTO_RETRIES      = int(os.getenv("MAX_GOTO_RETRIES", "5"))
 
 # Scroll/lazy-load robust
-MAX_SCROLL_STEPS        = int(os.getenv("MAX_SCROLL_STEPS", "80"))     # nb max de scroll-to-bottom
-SCROLL_PAUSE_MS         = int(os.getenv("SCROLL_PAUSE_MS", "700"))     # pause entre scrolls
-NO_GROWTH_RETRIES       = int(os.getenv("NO_GROWTH_RETRIES", "6"))     # cycles sans nouvelle tuile autorisés
-NO_HEIGHT_GROWTH_RETRY  = int(os.getenv("NO_HEIGHT_GROWTH_RETRY", "4"))# cycles sans hausse de scrollHeight
+MAX_SCROLL_STEPS        = int(os.getenv("MAX_SCROLL_STEPS", "120"))
+SCROLL_PAUSE_MS         = int(os.getenv("SCROLL_PAUSE_MS", "900"))
+NO_GROWTH_RETRIES       = int(os.getenv("NO_GROWTH_RETRIES", "10"))
+NO_HEIGHT_GROWTH_RETRY  = int(os.getenv("NO_HEIGHT_GROWTH_RETRY", "8"))
+
+# Prix sous lequel on exige une vérification de page détail
+VERIFY_BELOW_EUR        = float(os.getenv("VERIFY_BELOW_EUR", "1.00"))
+DETAIL_TIMEOUT_MS       = int(os.getenv("DETAIL_TIMEOUT_MS", "8000"))
 # -------------------------------------------------------
 
+STATE_FILE = "/tmp/altered_state.json"
 best_seen_price = math.inf
 best_seen_title = None
 
@@ -35,6 +40,26 @@ PRICE_RE  = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
+# ---------- persistance ----------
+def _load_state():
+    global best_seen_price, best_seen_title
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        best_seen_price = float(data.get("best_price", math.inf))
+        best_seen_title = data.get("best_title")
+        log(f"[STATE] Reprise meilleur prix: {best_seen_price if best_seen_price<math.inf else '∞'}")
+    except Exception:
+        log("[STATE] Aucun état précédent (nouveau déploiement).")
+
+def _save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"best_price": best_seen_price, "best_title": best_seen_title, "ts": datetime.utcnow().isoformat()}, f)
+    except Exception as e:
+        log(f"[STATE][WARN] Impossible d'écrire l'état: {e}")
+
+# ---------- IFTTT ----------
 def send_ifttt(title: str, price: float, link: str):
     if not IFTTT_KEY:
         log("[IFTTT][WARN] IFTTT_KEY manquant — notif non envoyée.")
@@ -49,9 +74,10 @@ def send_ifttt(title: str, price: float, link: str):
     except Exception as e:
         log(f"[IFTTT][ERR] {e}")
 
+# ---------- parsing ----------
 def parse_price(text: str) -> Optional[float]:
     t = text.replace("\xa0", " ").replace("\u202f", " ")
-    m = PRICE_RE.search(t) or re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", t)
+    m = PRICE_RE.search(t) or re.search(r"(\d+(?:[.,][0-9]{1,2})?)\s*€", t)
     if not m:
         return None
     try:
@@ -65,7 +91,6 @@ async def goto_with_retries(page, url: str) -> bool:
         try:
             log(f"[NAV] goto try {i}/{MAX_GOTO_RETRIES} → {url}")
             await page.goto(url, timeout=REQUEST_TIMEOUT_MS, wait_until="domcontentloaded")
-            # attendre que le badge bleu apparaisse au moins une fois
             await page.wait_for_selector('text=/À\\s*PARTIR\\s*DE/i', timeout=WAIT_BADGE_TIMEOUT_MS)
             return True
         except PWTimeout as e:
@@ -79,7 +104,7 @@ async def goto_with_retries(page, url: str) -> bool:
     log(f"[NAV][ERR] Échec navigation : {last_exc}")
     return False
 
-# ---------- Détection Foiler robuste ----------
+# ---------- filtres ----------
 async def is_foiler_block(item) -> bool:
     try:
         txt = (await item.inner_text()).replace("\xa0"," ").replace("\u202f"," ")
@@ -117,21 +142,34 @@ async def is_foiler_block(item) -> bool:
         pass
     return False
 
-# ---------- Extrait {title, price, url}; None si prix manquant / offre interne ----------
+# ---------- vérification de page détail (anti-Foiler) ----------
+async def verify_not_foiler_by_detail(context, url: Optional[str]) -> bool:
+    """Retourne True si la page détail ne contient pas 'Foiler'. False sinon / si échec."""
+    if not url:
+        return False
+    try:
+        page = await context.new_page()
+        await page.goto(url, timeout=DETAIL_TIMEOUT_MS, wait_until="domcontentloaded")
+        body = (await page.content()).lower()
+        await page.close()
+        if "foiler" in body:
+            return False
+        return True
+    except Exception:
+        return False
+
+# ---------- extraction ----------
 async def extract_title_price_url(item) -> Optional[Dict]:
     try:
         txt = await item.inner_text()
     except PWTimeout:
         return None
-
-    if DISPO_RE.search(txt):
+    if DISPO_RE.search(txt):  # ignore offres internes “Disponible à …”
         return None
-
     price = parse_price(txt)
     if price is None:
         return None
 
-    # Titre
     title = None
     try:
         t_el = item.locator("h3, h2, .title, [data-testid=card-title]").first
@@ -141,17 +179,14 @@ async def extract_title_price_url(item) -> Optional[Dict]:
         pass
     if not title:
         lines = [l.strip() for l in txt.splitlines() if l.strip()]
-        title = next(
-            (l for l in lines
-             if "À PARTIR" not in l.upper()
-             and "ACHETER" not in l.upper()
-             and "VENDRE"  not in l.upper()
-             and not DISPO_RE.search(l)),
-            "Carte unique"
-        )
+        title = next((l for l in lines
+                      if "À PARTIR" not in l.upper()
+                      and "ACHETER" not in l.upper()
+                      and "VENDRE"  not in l.upper()
+                      and not DISPO_RE.search(l)), "Carte unique")
 
-    # URL (prend un lien “propre” si dispo)
-    url = TARGET_URL
+    # détail_url candidate (utile pour la vérif)
+    detail_url = None
     try:
         links = item.locator("a")
         n = await links.count()
@@ -160,26 +195,26 @@ async def extract_title_price_url(item) -> Optional[Dict]:
             if not href:
                 continue
             low = href.lower()
-            if ("foiler" in low) or ("disponible" in low):
+            if "foiler" in low or "disponible" in low:
                 continue
-            if href.startswith("http"):
-                url = href
-            else:
-                from urllib.parse import urljoin
-                url = urljoin(TARGET_URL, href)
-            break
+            # on préfère les liens "cards"
+            if "cards" in low:
+                detail_url = href
+                break
+            # sinon on garde le 1er lien "propre"
+            if not detail_url:
+                detail_url = href
     except Exception:
         pass
 
-    return {"title": title, "price": price, "url": url}
+    if detail_url and not detail_url.startswith("http"):
+        from urllib.parse import urljoin
+        detail_url = urljoin(TARGET_URL, detail_url)
 
-# ---------- Trouve la 1ʳᵉ non-Foiler avec scroll-to-bottom robuste ----------
-async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
-    """
-    Candidats = blocs qui contiennent ACHETER + À PARTIR DE.
-    On ignore 'Disponible à …' (offres internes) et tout ce qui ressemble à Foiler.
-    On scrolle JUSQU'EN BAS tant que la page grandit (scrollHeight) ou que le nombre d'items augmente.
-    """
+    return {"title": title, "price": price, "detail_url": detail_url}
+
+# ---------- scroll + pick ----------
+async def find_first_non_foiler_with_scroll(context, page) -> Optional[Dict]:
     def build_locator():
         return page.locator("article, li, div").filter(
             has_text=re.compile(r"\bACHETER\b", re.I)
@@ -194,12 +229,11 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
     seen = 0
     leading_foiler = 0
     first_seen = True
-
     last_total = total
     no_growth = 0
     no_height_growth = 0
+    steps = 0
 
-    # helper: scroll à la hauteur max
     async def scroll_to_bottom_and_get_height():
         return await page.evaluate("""
             () => {
@@ -210,12 +244,10 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
             }
         """)
 
-    height = await scroll_to_bottom_and_get_height()  # 1er “bottom” (déclenche lazy-load)
+    prev_height = await scroll_to_bottom_and_get_height()
     await page.wait_for_timeout(SCROLL_PAUSE_MS)
 
-    steps = 0
     while True:
-        # traiter ce qui est chargé
         containers = build_locator()
         total = await containers.count()
 
@@ -237,7 +269,6 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
                         log("[CHECK] Première ligne = OK (non-Foiler).")
                 first_seen = False
 
-            # skip offres internes
             try:
                 txt = await item.inner_text()
             except Exception:
@@ -246,7 +277,6 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
                 seen += 1
                 continue
 
-            # skip Foiler
             if await is_foiler_block(item):
                 if leading_foiler == seen:
                     leading_foiler += 1
@@ -259,26 +289,35 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
             if not data:
                 continue
 
-            log(f"[PICK] 1ʳᵉ non-Foiler: {data['price']:.2f} € — {data['title']} — {data['url']}")
+            # *** Vérification détail si prix bas (p.ex. 0.23 € foiler) ***
+            if data["price"] <= VERIFY_BELOW_EUR:
+                ok = await verify_not_foiler_by_detail(context, data["detail_url"])
+                if not ok:
+                    log(f"[VERIFY] {data['price']:.2f} € suspect (≤ {VERIFY_BELOW_EUR:.2f}) → détail=Foiler/indispo → ignorée.")
+                    continue
+
+            # URL finale à notifier : on utilise le détail si on l'a, sinon la liste
+            url = data["detail_url"] or TARGET_URL
+            log(f"[PICK] 1ʳᵉ non-Foiler: {data['price']:.2f} € — {data['title']} — {url}")
             if leading_foiler:
                 log(f"[INFO] Foiler en tête de liste ignorés : {leading_foiler}")
-            return data
+            return {"title": data["title"], "price": data["price"], "url": url}
 
-        # si on a tout parcouru → tenter de charger plus, sinon sortir
         if steps >= MAX_SCROLL_STEPS:
             log("[SCROLL][STOP] MAX_SCROLL_STEPS atteint.")
             break
 
-        prev_height = height
-        height = await scroll_to_bottom_and_get_height()
+        old_height = prev_height
+        prev_height = await scroll_to_bottom_and_get_height()
         await page.wait_for_timeout(SCROLL_PAUSE_MS)
         steps += 1
 
         containers = build_locator()
         total = await containers.count()
-
         grew = total > last_total
-        height_grew = (await page.evaluate("document.scrollingElement ? document.scrollingElement.scrollHeight : document.documentElement.scrollHeight")) > prev_height
+        height_grew = (await page.evaluate(
+            "document.scrollingElement ? document.scrollingElement.scrollHeight : document.documentElement.scrollHeight"
+        )) > old_height
 
         if grew:
             log(f"[SCROLL] Nouvelles cartes chargées : {last_total} → {total}")
@@ -307,7 +346,8 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
 async def main():
     global best_seen_price, best_seen_title
 
-    log("[BOOT] Surveillance Altered marketplace (1ʳᵉ carte non-Foiler, scroll-to-bottom robuste)")
+    log("[BOOT] Altered monitor v4 (anti-Foiler vérif détail + scroll robuste + persistance)")
+    _load_state()
 
     if not os.path.exists(STATE_PATH):
         log(f"[AUTH][ERR] Fichier de session introuvable : {STATE_PATH}")
@@ -344,24 +384,25 @@ async def main():
                     await asyncio.sleep(max(POLL_SECONDS, 60))
                     continue
 
-                # petit jump initial vers le bas pour déclencher le 1er lazy-load
                 try:
                     await page.evaluate("window.scrollTo(0, 400)")
                 except Exception:
                     pass
 
-                card = await find_first_non_foiler_with_scroll(page)
+                card = await find_first_non_foiler_with_scroll(context, page)
 
                 if not card:
                     log("[INFO] Pas de carte utilisable sur cette itération.")
                 else:
                     price, title, url = card["price"], card["title"], card["url"]
                     log(f"[INFO] Min courant (1ʳᵉ non-Foiler): {price:.2f} € — {title} — {url}")
+
                     if (best_seen_price is math.inf) or (price < best_seen_price - 1e-9):
                         log(f"[ALERT] Nouveau plus bas {price:.2f} € "
                             f"(ancien {best_seen_price if best_seen_price < math.inf else '∞'})")
                         send_ifttt(title or "Carte unique", price, url)
                         best_seen_price, best_seen_title = price, title
+                        _save_state()
 
             except PWTimeout:
                 log("[WARN] Timeout Playwright.")
@@ -372,6 +413,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
