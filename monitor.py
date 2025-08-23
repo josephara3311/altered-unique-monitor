@@ -14,22 +14,23 @@ USER_AGENT   = os.getenv("USER_AGENT",
     "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 )
 STATE_PATH   = os.getenv("STORAGE_STATE_PATH", "/etc/secrets/storage_state.json")
-REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))
+REQUEST_TIMEOUT_MS    = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))
 WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "15000"))
-MAX_GOTO_RETRIES = int(os.getenv("MAX_GOTO_RETRIES", "5"))
+MAX_GOTO_RETRIES      = int(os.getenv("MAX_GOTO_RETRIES", "5"))
 
-# Scroll/lazy-load
-MAX_SCROLL_STEPS   = int(os.getenv("MAX_SCROLL_STEPS", "40"))
-SCROLL_PAUSE_MS    = int(os.getenv("SCROLL_PAUSE_MS", "600"))
-NO_GROWTH_RETRIES  = int(os.getenv("NO_GROWTH_RETRIES", "4"))
+# Scroll/lazy-load robust
+MAX_SCROLL_STEPS        = int(os.getenv("MAX_SCROLL_STEPS", "80"))     # nb max de scroll-to-bottom
+SCROLL_PAUSE_MS         = int(os.getenv("SCROLL_PAUSE_MS", "700"))     # pause entre scrolls
+NO_GROWTH_RETRIES       = int(os.getenv("NO_GROWTH_RETRIES", "6"))     # cycles sans nouvelle tuile autorisés
+NO_HEIGHT_GROWTH_RETRY  = int(os.getenv("NO_HEIGHT_GROWTH_RETRY", "4"))# cycles sans hausse de scrollHeight
 # -------------------------------------------------------
 
 best_seen_price = math.inf
 best_seen_title = None
 
 FOILER_RE = re.compile(r"\b(foiler|foil)\b", re.I)
-PRICE_RE  = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", re.I)
 DISPO_RE  = re.compile(r"\bDisponible\s+à\b", re.I)  # lignes d'offres internes
+PRICE_RE  = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", re.I)
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -64,16 +65,17 @@ async def goto_with_retries(page, url: str) -> bool:
         try:
             log(f"[NAV] goto try {i}/{MAX_GOTO_RETRIES} → {url}")
             await page.goto(url, timeout=REQUEST_TIMEOUT_MS, wait_until="domcontentloaded")
+            # attendre que le badge bleu apparaisse au moins une fois
             await page.wait_for_selector('text=/À\\s*PARTIR\\s*DE/i', timeout=WAIT_BADGE_TIMEOUT_MS)
             return True
         except PWTimeout as e:
             last_exc = e
             log(f"[NAV][WARN] Timeout goto/wait (try {i}) : {e}")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.2)
         except Exception as e:
             last_exc = e
             log(f"[NAV][WARN] Exception goto (try {i}) : {e}")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.2)
     log(f"[NAV][ERR] Échec navigation : {last_exc}")
     return False
 
@@ -91,7 +93,6 @@ async def is_foiler_block(item) -> bool:
     except Exception:
         pass
     try:
-        # attributs alt/title/aria-label + classes
         loc = item.locator("*")
         n = min(await loc.count(), 8)
         for i in range(n):
@@ -106,7 +107,6 @@ async def is_foiler_block(item) -> bool:
     except Exception:
         pass
     try:
-        # hrefs
         links = item.locator("a")
         n = await links.count()
         for i in range(min(n, 8)):
@@ -117,14 +117,13 @@ async def is_foiler_block(item) -> bool:
         pass
     return False
 
-# ---------- Extrait {title, price, url}; None si prix manquant ----------
+# ---------- Extrait {title, price, url}; None si prix manquant / offre interne ----------
 async def extract_title_price_url(item) -> Optional[Dict]:
     try:
         txt = await item.inner_text()
     except PWTimeout:
         return None
 
-    # ignorer explicitement les lignes d'offres internes
     if DISPO_RE.search(txt):
         return None
 
@@ -132,7 +131,7 @@ async def extract_title_price_url(item) -> Optional[Dict]:
     if price is None:
         return None
 
-    # titre
+    # Titre
     title = None
     try:
         t_el = item.locator("h3, h2, .title, [data-testid=card-title]").first
@@ -151,7 +150,7 @@ async def extract_title_price_url(item) -> Optional[Dict]:
             "Carte unique"
         )
 
-    # URL (prend un lien le plus “propre” possible si dispo)
+    # URL (prend un lien “propre” si dispo)
     url = TARGET_URL
     try:
         links = item.locator("a")
@@ -161,8 +160,7 @@ async def extract_title_price_url(item) -> Optional[Dict]:
             if not href:
                 continue
             low = href.lower()
-            # on évite market/foiler/offre
-            if ("market" in low and "cards" in low) or ("foiler" in low) or ("disponible" in low):
+            if ("foiler" in low) or ("disponible" in low):
                 continue
             if href.startswith("http"):
                 url = href
@@ -175,14 +173,12 @@ async def extract_title_price_url(item) -> Optional[Dict]:
 
     return {"title": title, "price": price, "url": url}
 
-# ---------- Trouve la 1re carte non-Foiler avec auto-scroll ----------
+# ---------- Trouve la 1ʳᵉ non-Foiler avec scroll-to-bottom robuste ----------
 async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
     """
     Candidats = blocs qui contiennent ACHETER + À PARTIR DE.
-    On ignore :
-      - tout bloc contenant 'Disponible à' (offres internes),
-      - tout bloc détecté 'Foiler'.
-    On scrolle tant qu'on n'a pas de résultat (avec gardes-fous).
+    On ignore 'Disponible à …' (offres internes) et tout ce qui ressemble à Foiler.
+    On scrolle JUSQU'EN BAS tant que la page grandit (scrollHeight) ou que le nombre d'items augmente.
     """
     def build_locator():
         return page.locator("article, li, div").filter(
@@ -198,17 +194,35 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
     seen = 0
     leading_foiler = 0
     first_seen = True
+
     last_total = total
     no_growth = 0
-    scrolls = 0
+    no_height_growth = 0
 
+    # helper: scroll à la hauteur max
+    async def scroll_to_bottom_and_get_height():
+        return await page.evaluate("""
+            () => {
+                const el = document.scrollingElement || document.documentElement;
+                const before = el.scrollHeight;
+                el.scrollTo(0, el.scrollHeight);
+                return before;
+            }
+        """)
+
+    height = await scroll_to_bottom_and_get_height()  # 1er “bottom” (déclenche lazy-load)
+    await page.wait_for_timeout(SCROLL_PAUSE_MS)
+
+    steps = 0
     while True:
+        # traiter ce qui est chargé
+        containers = build_locator()
+        total = await containers.count()
+
         while seen < total:
             item = containers.nth(seen)
 
-            # log de sécu sur le tout premier bloc
             if first_seen:
-                # s'il est une offre interne, on ne compte pas dans leading_foiler
                 try:
                     raw = await item.inner_text()
                 except Exception:
@@ -223,7 +237,7 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
                         log("[CHECK] Première ligne = OK (non-Foiler).")
                 first_seen = False
 
-            # ignorer offres internes
+            # skip offres internes
             try:
                 txt = await item.inner_text()
             except Exception:
@@ -232,7 +246,7 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
                 seen += 1
                 continue
 
-            # ignorer Foiler
+            # skip Foiler
             if await is_foiler_block(item):
                 if leading_foiler == seen:
                     leading_foiler += 1
@@ -250,27 +264,39 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
                 log(f"[INFO] Foiler en tête de liste ignorés : {leading_foiler}")
             return data
 
-        # pas trouvé → tenter de charger plus
-        if scrolls >= MAX_SCROLL_STEPS:
+        # si on a tout parcouru → tenter de charger plus, sinon sortir
+        if steps >= MAX_SCROLL_STEPS:
             log("[SCROLL][STOP] MAX_SCROLL_STEPS atteint.")
             break
 
-        await page.evaluate("window.scrollBy(0, Math.max(window.innerHeight, 900))")
+        prev_height = height
+        height = await scroll_to_bottom_and_get_height()
         await page.wait_for_timeout(SCROLL_PAUSE_MS)
-        scrolls += 1
+        steps += 1
 
         containers = build_locator()
         total = await containers.count()
-        if total > last_total:
+
+        grew = total > last_total
+        height_grew = (await page.evaluate("document.scrollingElement ? document.scrollingElement.scrollHeight : document.documentElement.scrollHeight")) > prev_height
+
+        if grew:
             log(f"[SCROLL] Nouvelles cartes chargées : {last_total} → {total}")
             last_total = total
             no_growth = 0
         else:
             no_growth += 1
             log(f"[SCROLL] Pas de nouvelles cartes (essai {no_growth}/{NO_GROWTH_RETRIES}).")
-            if no_growth >= NO_GROWTH_RETRIES:
-                log("[SCROLL][STOP] Plus de croissance, on s'arrête.")
-                break
+
+        if height_grew:
+            no_height_growth = 0
+        else:
+            no_height_growth += 1
+            log(f"[SCROLL] Hauteur inchangée (essai {no_height_growth}/{NO_HEIGHT_GROWTH_RETRY}).")
+
+        if no_growth >= NO_GROWTH_RETRIES and no_height_growth >= NO_HEIGHT_GROWTH_RETRY:
+            log("[SCROLL][STOP] Plus de croissance (items & hauteur), on s'arrête.")
+            break
 
     if leading_foiler:
         log(f"[INFO] Foiler en tête de liste ignorés : {leading_foiler}")
@@ -281,7 +307,7 @@ async def find_first_non_foiler_with_scroll(page) -> Optional[Dict]:
 async def main():
     global best_seen_price, best_seen_title
 
-    log("[BOOT] Surveillance Altered marketplace (1ʳᵉ carte non-Foiler, auto-scroll, anti-'Disponible à')")
+    log("[BOOT] Surveillance Altered marketplace (1ʳᵉ carte non-Foiler, scroll-to-bottom robuste)")
 
     if not os.path.exists(STATE_PATH):
         log(f"[AUTH][ERR] Fichier de session introuvable : {STATE_PATH}")
@@ -318,7 +344,7 @@ async def main():
                     await asyncio.sleep(max(POLL_SECONDS, 60))
                     continue
 
-                # petit scroll initial
+                # petit jump initial vers le bas pour déclencher le 1er lazy-load
                 try:
                     await page.evaluate("window.scrollTo(0, 400)")
                 except Exception:
@@ -346,8 +372,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
 
 
 
