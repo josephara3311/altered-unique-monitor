@@ -25,7 +25,7 @@ NO_GROWTH_RETRIES       = int(os.getenv("NO_GROWTH_RETRIES", "10"))
 NO_HEIGHT_GROWTH_RETRY  = int(os.getenv("NO_HEIGHT_GROWTH_RETRY", "8"))
 
 # Prix sous lequel on exige une vérification de page détail
-VERIFY_BELOW_EUR        = float(os.getenv("VERIFY_BELOW_EUR", "1.00"))
+VERIFY_BELOW_EUR        = float(os.getenv("VERIFY_BELOW_EUR", "0.60"))
 DETAIL_TIMEOUT_MS       = int(os.getenv("DETAIL_TIMEOUT_MS", "8000"))
 # -------------------------------------------------------
 
