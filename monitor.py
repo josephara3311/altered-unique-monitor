@@ -1,7 +1,7 @@
 # monitor.py
 import os, re, time, math, asyncio, traceback, requests
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # --------- Config (via variables d'env Render) ----------
@@ -14,10 +14,9 @@ USER_AGENT   = os.getenv("USER_AGENT",
     "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 )
 STATE_PATH   = os.getenv("STORAGE_STATE_PATH", "/etc/secrets/storage_state.json")
-REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))       # timeout par action
-WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "15000")) # attente spécifique des badges/prix
+REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "25000"))
+WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "15000"))
 MAX_GOTO_RETRIES = int(os.getenv("MAX_GOTO_RETRIES", "3"))
-MAX_SCAN_ITEMS = int(os.getenv("MAX_SCAN_ITEMS", "200"))                 # garde-fou perfs
 # -------------------------------------------------------
 
 best_seen_price = math.inf
@@ -43,11 +42,9 @@ def send_ifttt(title: str, price: float, link: str):
 PRICE_RE = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", re.I)
 
 def parse_price_from_text(text: str) -> Optional[float]:
-    # gère les espaces insécables / fines
     t = text.replace("\xa0", " ").replace("\u202f", " ")
     m = PRICE_RE.search(t)
     if not m:
-        # fallback très permissif (dernière chance)
         m2 = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", t)
         if not m2:
             return None
@@ -59,14 +56,12 @@ def parse_price_from_text(text: str) -> Optional[float]:
     except ValueError:
         return None
 
-async def goto_with_retries(page, url: str):
+async def goto_with_retries(page, url: str) -> bool:
     last_exc = None
     for i in range(1, MAX_GOTO_RETRIES + 1):
         try:
             log(f"[NAV] goto try {i}/{MAX_GOTO_RETRIES} → {url}")
-            # domcontentloaded = plus fiable/rapide que networkidle pour des sites SPA
             await page.goto(url, timeout=REQUEST_TIMEOUT_MS, wait_until="domcontentloaded")
-            # attendre la présence d’un badge/prix "À PARTIR DE" (n’importe où) pour s’assurer que la liste a rendu
             await page.wait_for_selector('text=/À\\s*PARTIR\\s*DE/i', timeout=WAIT_BADGE_TIMEOUT_MS)
             return True
         except PWTimeout as e:
@@ -80,15 +75,11 @@ async def goto_with_retries(page, url: str):
     log(f"[NAV][ERR] Échec de navigation après {MAX_GOTO_RETRIES} tentatives : {last_exc}")
     return False
 
-async def find_min_price_card(page) -> Dict:
+async def pick_first_two_non_foiler(page) -> List[Dict]:
     """
-    Récupère toutes les "cards" qui :
-      - contiennent un bouton 'ACHETER'
-      - contiennent un prix 'À PARTIR DE X €'
-      - NE contiennent PAS 'Foiler' (strict, insensible à la casse)
-    Retourne {count, min_price, min_card:{title, price, url}}
+    Parcourt les cards dans l'ordre d'affichage et renvoie au plus 2 cartes non-Foiler :
+    [{title, price, url}, ...] (longueur 0..2)
     """
-    # conteneurs plausibles ; on commence large puis on filtre
     containers = page.locator("article, li, div").filter(
         has_text=re.compile(r"\bACHETER\b", re.I)
     ).filter(
@@ -96,38 +87,41 @@ async def find_min_price_card(page) -> Dict:
     )
 
     total = await containers.count()
-    log(f"[SCRAPE] Conteneurs (ACHETER + À PARTIR DE) : {total}")
+    log(f"[SCRAPE] Conteneurs candidats (ACHETER + À PARTIR DE) : {total}")
 
-    cards: List[Dict] = []
-    scan_count = min(total, MAX_SCAN_ITEMS)
-    for i in range(scan_count):
+    selected: List[Dict] = []
+
+    # On parcourt dans l'ordre et on s'arrête dès qu'on a 2 non-Foiler
+    for i in range(total):
+        if len(selected) >= 2:
+            break
+
         item = containers.nth(i)
 
-        # texte brut (1 seule fois pour limiter les appels)
         try:
             txt = await item.inner_text()
         except PWTimeout:
             continue
 
-        # exclure Foiler STRICT (avant toute autre extraction)
+        # Exclusion stricte "Foiler"
         if re.search(r"\bFoiler\b", txt, re.I):
+            # pour debug léger, montrer qu'on a bien ignoré
+            log(f"[FILTER] Ligne {i}: Foiler → ignorée.")
             continue
 
-        # prix depuis le badge
         price = parse_price_from_text(txt)
         if price is None:
-            # log minimal pour debug si besoin
+            # pas de prix parsable : ignorer
             snippet = " | ".join([l.strip() for l in txt.splitlines() if l.strip()])[:160]
-            log(f"[DEBUG] Prix non parsé (skip) : {snippet}")
+            log(f"[DEBUG] Ligne {i}: prix non parsé → ignorée. Extrait: {snippet}")
             continue
 
-        # titre : préférer un élément titre, sinon heuristique propre
+        # Titre
         title = None
         try:
             title_el = item.locator("h3, h2, .title, [data-testid=card-title]").first
             if await title_el.count() > 0:
-                t = await title_el.inner_text()
-                title = t.strip()
+                title = (await title_el.inner_text()).strip()
         except Exception:
             pass
         if not title:
@@ -141,7 +135,7 @@ async def find_min_price_card(page) -> Dict:
                 "Carte unique"
             )
 
-        # URL (fallback = TARGET_URL)
+        # URL
         url = TARGET_URL
         try:
             link = item.locator("a").first
@@ -156,22 +150,23 @@ async def find_min_price_card(page) -> Dict:
         except Exception:
             pass
 
-        cards.append({"title": title, "price": price, "url": url})
+        selected.append({"title": title, "price": price, "url": url})
+        log(f"[PICK] #{len(selected)} → {price:.2f} € — {title} — {url}")
 
-    cards.sort(key=lambda x: x["price"])
-    min_card = cards[0] if cards else None
-    min_price = min_card["price"] if min_card else None
+    return selected
 
-    return {
-        "count": len(cards),
-        "min_price": min_price,
-        "min_card": min_card
-    }
+def min_from_selected(cards: List[Dict]) -> Tuple[Optional[Dict], Optional[float]]:
+    if not cards:
+        return None, None
+    # L'URL est triée ASC donc en pratique cards[0] est le min,
+    # mais on prend le min par sécurité si jamais l'ordre est bizarre.
+    best = min(cards, key=lambda c: c["price"])
+    return best, best["price"]
 
 async def main():
     global best_seen_price, best_seen_title
 
-    log("[BOOT] Surveillance Altered marketplace")
+    log("[BOOT] Surveillance Altered marketplace (2 premières cartes non-Foiler)")
 
     if not os.path.exists(STATE_PATH):
         log(f"[AUTH][ERR] Fichier de session introuvable : {STATE_PATH}")
@@ -183,7 +178,7 @@ async def main():
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        # IMPORTANT : lecture seule, on ne sauvegarde jamais l'état → pas de risque d'écraser
+        # Lecture seule du storage_state (aucun risque d’écraser)
         context = await browser.new_context(
             user_agent=USER_AGENT,
             locale="fr-FR",
@@ -198,38 +193,37 @@ async def main():
 
                 ok = await goto_with_retries(page, TARGET_URL)
                 if not ok:
-                    # on skip l’itération actuelle, on réessaie au prochain tour
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
-                # session expirée ?
                 if page.url.startswith("https://auth.altered.gg"):
                     log("[AUTH][ERR] Session expirée / login requis. Regénère storage_state.json.")
                     await asyncio.sleep(max(POLL_SECONDS, 60))
                     continue
 
-                # déclenche éventuellement du lazy-load
+                # Déclencher éventuellement du lazy-load
                 try:
                     await page.evaluate("window.scrollTo(0, 600)")
                 except Exception:
                     pass
 
-                data = await find_min_price_card(page)
-                cnt = data["count"]
-                min_price = data["min_price"]
-                min_card = data["min_card"]
+                # === NOUVEAU : on ne garde que les 2 premières non-Foiler ===
+                selected = await pick_first_two_non_foiler(page)
+                log(f"[INFO] Cartes retenues (non-Foiler) : {len(selected)} (max 2)")
 
-                if cnt == 0 or min_price is None or not min_card:
-                    log("[INFO] 0 carte unique détectée (Foiler exclus).")
+                best_card, min_price = min_from_selected(selected)
+
+                if not best_card:
+                    log("[INFO] Aucune carte non-Foiler trouvée parmi les premières lignes.")
                 else:
-                    log(f"[INFO] Cartes uniques détectées (Foiler exclus) : {cnt}")
-                    log(f"[INFO] Min courant : {min_price:.2f} € — {min_card['title']} — {min_card['url']}")
+                    log(f"[INFO] Min courant (sur 1–2 cartes) : {min_price:.2f} € — "
+                        f"{best_card['title']} — {best_card['url']}")
 
                     # Alerte uniquement si nouveau plus bas strict
                     if (best_seen_price is math.inf) or (min_price < best_seen_price - 1e-9):
                         log(f"[ALERT] Nouveau plus bas {min_price:.2f} € (ancien {best_seen_price if best_seen_price < math.inf else '∞'})")
-                        send_ifttt(min_card['title'] or "Carte unique", min_price, min_card['url'])
-                        best_seen_price, best_seen_title = min_price, min_card['title']
+                        send_ifttt(best_card['title'] or "Carte unique", min_price, best_card['url'])
+                        best_seen_price, best_seen_title = min_price, best_card['title']
 
             except PWTimeout:
                 log("[WARN] Timeout d'action Playwright (goto / selector).")
@@ -240,6 +234,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
