@@ -75,11 +75,32 @@ async def goto_with_retries(page, url: str) -> bool:
     log(f"[NAV][ERR] Échec de navigation après {MAX_GOTO_RETRIES} tentatives : {last_exc}")
     return False
 
+# --------- Debug helper : dump des hrefs d'un bloc ----------
+async def _debug_dump_hrefs(item, idx):
+    try:
+        links = item.locator("a")
+        n = await links.count()
+        hrefs = []
+        for k in range(min(n, 6)):  # limite les logs
+            h = await links.nth(k).get_attribute("href")
+            if h:
+                hrefs.append(h)
+        if hrefs:
+            log(f"[DEBUG][L{idx}] hrefs: {hrefs}")
+        else:
+            log(f"[DEBUG][L{idx}] aucun <a href> dans ce bloc")
+    except Exception as e:
+        log(f"[DEBUG][L{idx}] erreur dump hrefs: {e}")
+
+# --------- Sélection des 2 premières vraies cartes ----------
 async def pick_first_two_real_cards(page):
     """
     Garde uniquement les 2 premières 'vraies' cartes :
     - contiennent ACHETER + 'À PARTIR DE'
-    - et possèdent un lien détail a[href*="/cards/"] (critère éliminant Foiler/QR/coupons).
+    - et possèdent un lien détail acceptable:
+        * au moins un <a href> qui contient 'cards'
+        * ne contient PAS 'market' ni 'foiler'
+    On logge aussi les hrefs des 8 premières lignes pour diagnostic.
     """
     containers = page.locator("article, li, div").filter(
         has_text=re.compile(r"\bACHETER\b", re.I)
@@ -102,14 +123,32 @@ async def pick_first_two_real_cards(page):
 
         item = containers.nth(i)
 
-        # Exiger un lien détail vers une vraie carte
-        detail = item.locator('a[href*="/cards/"]').first
-        has_detail = (await detail.count()) > 0
+        # Dump diagnostique des hrefs sur les 8 premières lignes
+        if i < 8:
+            await _debug_dump_hrefs(item, i)
+
+        # Cherche un href "détail carte" fiable
+        href_detail = None
+        try:
+            links = item.locator("a")
+            nlinks = await links.count()
+            for k in range(nlinks):
+                href = await links.nth(k).get_attribute("href")
+                if not href:
+                    continue
+                low = href.lower()
+                if ("cards" in low) and ("market" not in low) and ("foiler" not in low):
+                    href_detail = href
+                    break
+        except Exception:
+            pass
+
+        has_detail = href_detail is not None
 
         # Log de sécurité sur la toute première ligne visible
         if first_seen:
             if not has_detail:
-                log("[CHECK] Première carte visible = ignorée (pas de lien détail /cards/ → probable Foiler/QR).")
+                log("[CHECK] Première carte visible = ignorée (pas de lien détail valable → probable Foiler/QR).")
                 leading_ignored += 1
             else:
                 log("[CHECK] Première carte visible = OK (lien détail présent).")
@@ -120,7 +159,7 @@ async def pick_first_two_real_cards(page):
             ignored_no_detail += 1
             if not first_real_seen:
                 leading_ignored += 1
-            log(f"[FILTER] Ligne {i}: pas de lien détail '/cards/' → ignorée (probable Foiler/QR).")
+            log(f"[FILTER] Ligne {i}: pas de lien détail valable → ignorée (probable Foiler/QR).")
             continue
 
         first_real_seen = True
@@ -154,20 +193,15 @@ async def pick_first_two_real_cards(page):
                 "Carte unique"
             )
 
-        # URL détail garantie
-        url = None
+        # URL détail normalisée
         try:
-            href = await detail.get_attribute("href")
-            if href:
-                if href.startswith("http"):
-                    url = href
-                else:
-                    from urllib.parse import urljoin
-                    url = urljoin(TARGET_URL, href)
+            if href_detail.startswith("http"):
+                url = href_detail
+            else:
+                from urllib.parse import urljoin
+                url = urljoin(TARGET_URL, href_detail)
         except Exception:
-            pass
-        if not url:
-            log(f"[FILTER] Ligne {i}: impossible d’extraire le lien détail → ignorée.")
+            log(f"[FILTER] Ligne {i}: impossible de normaliser le lien détail → ignorée.")
             continue
 
         selected.append({"title": title, "price": price, "url": url})
@@ -186,6 +220,7 @@ def min_from_selected(cards: List[Dict]) -> Tuple[Optional[Dict], Optional[float
     best = min(cards, key=lambda c: c["price"])
     return best, best["price"]
 
+# ------------------------- MAIN LOOP -------------------------
 async def main():
     global best_seen_price, best_seen_title
 
@@ -200,11 +235,16 @@ async def main():
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            locale="fr-FR",
-            storage_state=STATE_PATH
-        )
+        context_kwargs = dict(locale="fr-FR", storage_state=STATE_PATH)
+        # USER_AGENT optionnel : seulement s'il est propre (ASCII une ligne)
+        UA = (USER_AGENT or "").strip()
+        if UA and all(32 <= ord(c) <= 126 for c in UA):
+            context_kwargs["user_agent"] = UA
+        else:
+            if UA:
+                log("[UA][WARN] USER_AGENT invalide (caractères non-ASCII / retours ligne). Ignoré.")
+
+        context = await browser.new_context(**context_kwargs)
         context.set_default_timeout(REQUEST_TIMEOUT_MS)
         page = await context.new_page()
 
