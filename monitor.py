@@ -2,6 +2,7 @@
 import os, re, math, json, asyncio, traceback, requests
 from datetime import datetime
 from typing import Optional, Dict
+from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # --------- Config (via variables d'env Render) ----------
@@ -18,22 +19,23 @@ REQUEST_TIMEOUT_MS    = int(os.getenv("REQUEST_TIMEOUT_MS", "45000"))
 WAIT_BADGE_TIMEOUT_MS = int(os.getenv("WAIT_BADGE_TIMEOUT_MS", "25000"))
 MAX_GOTO_RETRIES      = int(os.getenv("MAX_GOTO_RETRIES", "5"))
 
-# Scroll/lazy-load robust
+# Scroll/lazy-load
 MAX_SCROLL_STEPS        = int(os.getenv("MAX_SCROLL_STEPS", "120"))
 SCROLL_PAUSE_MS         = int(os.getenv("SCROLL_PAUSE_MS", "900"))
 NO_GROWTH_RETRIES       = int(os.getenv("NO_GROWTH_RETRIES", "10"))
 NO_HEIGHT_GROWTH_RETRY  = int(os.getenv("NO_HEIGHT_GROWTH_RETRY", "8"))
 
-# Prix sous lequel on exige une vérification de page détail
-VERIFY_BELOW_EUR        = float(os.getenv("VERIFY_BELOW_EUR", "0.60"))
-DETAIL_TIMEOUT_MS       = int(os.getenv("DETAIL_TIMEOUT_MS", "8000"))
+# Prix sous lequel on exige une vérification de fiche détail /cards/
+VERIFY_BELOW_EUR        = float(os.getenv("VERIFY_BELOW_EUR", "1.50"))
+DETAIL_TIMEOUT_MS       = int(os.getenv("DETAIL_TIMEOUT_MS", "10000"))
 # -------------------------------------------------------
 
 STATE_FILE = "/tmp/altered_state.json"
 best_seen_price = math.inf
 best_seen_title = None
 
-FOILER_RE = re.compile(r"\b(foiler|foil)\b", re.I)
+# IMPORTANT: on ne matche plus "foil", seulement "foiler"
+FOILER_RE_STRICT = re.compile(r"\bfoiler\b", re.I)
 DISPO_RE  = re.compile(r"\bDisponible\s+à\b", re.I)  # lignes d'offres internes
 PRICE_RE  = re.compile(r"À\s*PARTIR\s*DE\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*€", re.I)
 
@@ -91,7 +93,8 @@ async def goto_with_retries(page, url: str) -> bool:
         try:
             log(f"[NAV] goto try {i}/{MAX_GOTO_RETRIES} → {url}")
             await page.goto(url, timeout=REQUEST_TIMEOUT_MS, wait_until="domcontentloaded")
-            await page.wait_for_selector('text=/À\\s*PARTIR\\s*DE/i', timeout=WAIT_BADGE_TIMEOUT_MS)
+            # Il se peut que la page ne contienne pas encore le badge de prix :
+            await page.wait_for_load_state("domcontentloaded")
             return True
         except PWTimeout as e:
             last_exc = e
@@ -104,62 +107,137 @@ async def goto_with_retries(page, url: str) -> bool:
     log(f"[NAV][ERR] Échec navigation : {last_exc}")
     return False
 
+# ---------- util: rendre absolu ----------
+def abs_url(base: str, href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    if href.startswith("http"):
+        return href
+    return urljoin(base, href)
+
 # ---------- filtres ----------
 async def is_foiler_block(item) -> bool:
+    """
+    Politique stricte: on considère Foiler uniquement si on voit le terme 'Foiler' en clair
+    dans ce bloc (texte visible, badge, title/alt/aria-label), ou si un lien contient 'foiler'
+    en mot complet. On NE match PAS 'foil' seul.
+    """
     try:
-        txt = (await item.inner_text()).replace("\xa0"," ").replace("\u202f"," ")
-    except Exception:
-        txt = ""
-    if FOILER_RE.search(txt):
-        return True
-    try:
-        if await item.locator("text=/foiler/i").count() > 0:
+        # Texte visible du bloc
+        visible_txt = (await item.inner_text()).replace("\xa0"," ").replace("\u202f"," ")
+        if FOILER_RE_STRICT.search(visible_txt):
             return True
     except Exception:
         pass
+
+    # Petits attributs sur descendants
     try:
         loc = item.locator("*")
-        n = min(await loc.count(), 8)
+        n = min(await loc.count(), 12)
         for i in range(n):
             el = loc.nth(i)
             for attr in ["aria-label", "title", "alt"]:
                 v = await el.get_attribute(attr)
-                if v and FOILER_RE.search(v):
+                if v and FOILER_RE_STRICT.search(v):
                     return True
             cls = await el.get_attribute("class")
-            if cls and "foiler" in cls.lower():
+            if cls and FOILER_RE_STRICT.search(cls):
                 return True
     except Exception:
         pass
+
+    # Liens: on ne blackliste que si 'foiler' est un segment/param clair
     try:
         links = item.locator("a")
         n = await links.count()
         for i in range(min(n, 8)):
             href = await links.nth(i).get_attribute("href") or ""
-            if FOILER_RE.search(href):
+            if FOILER_RE_STRICT.search(href):
                 return True
     except Exception:
         pass
+
     return False
+
+# ---------- résolution vers /cards/ ----------
+async def resolve_to_card_detail(context, url: Optional[str]) -> Optional[str]:
+    """
+    Garantit qu'on renvoie une URL de fiche /cards/... si possible.
+    - Si url est déjà /cards/, ok.
+    - Sinon ouvre la page, tente <link rel="canonical">, puis le premier a[href*="/cards/"] visible/clickable.
+    """
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if "/cards/" in parsed.path:
+            return url  # déjà une fiche
+    except Exception:
+        pass
+
+    page = await context.new_page()
+    try:
+        await page.goto(url, timeout=DETAIL_TIMEOUT_MS, wait_until="domcontentloaded")
+        # 1) canonical
+        try:
+            canonical = await page.locator('link[rel="canonical"]').get_attribute("href")
+        except Exception:
+            canonical = None
+        if canonical and "/cards/" in canonical:
+            final_url = abs_url(url, canonical)
+            await page.close()
+            return final_url
+
+        # 2) premier lien vers /cards/
+        link = page.locator('a[href*="/cards/"]').first
+        if await link.count() > 0:
+            href = await link.get_attribute("href")
+            final_url = abs_url(url, href)
+            await page.close()
+            return final_url
+
+        await page.close()
+        return url  # fallback: rien de mieux
+    except Exception:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return url
 
 # ---------- vérification de page détail (anti-Foiler) ----------
 async def verify_not_foiler_by_detail(context, url: Optional[str]) -> bool:
-    """Retourne True si la page détail ne contient pas 'Foiler'. False sinon / si échec."""
+    """Retourne True si la fiche /cards/... ne contient pas 'Foiler' (visible). False sinon/échec."""
     if not url:
+        return False
+    detail = await resolve_to_card_detail(context, url)
+    if not detail:
         return False
     try:
         page = await context.new_page()
-        await page.goto(url, timeout=DETAIL_TIMEOUT_MS, wait_until="domcontentloaded")
-        body = (await page.content()).lower()
+        await page.goto(detail, timeout=DETAIL_TIMEOUT_MS, wait_until="domcontentloaded")
+
+        # Si n'importe quel élément avec texte 'Foiler' est visible → Foiler
+        try:
+            foiler_visible = await page.locator("text=/\\bFoiler\\b/i").is_visible(timeout=2000)
+        except Exception:
+            foiler_visible = False
+
+        body_text = ""
+        try:
+            body_text = (await page.inner_text("body")).lower()
+        except Exception:
+            pass
+
         await page.close()
-        if "foiler" in body:
+        if foiler_visible or ("foiler" in body_text):
             return False
         return True
     except Exception:
         return False
 
 # ---------- extraction ----------
-async def extract_title_price_url(item) -> Optional[Dict]:
+async def extract_title_price_url(base_url: str, item) -> Optional[Dict]:
     try:
         txt = await item.inner_text()
     except PWTimeout:
@@ -170,9 +248,10 @@ async def extract_title_price_url(item) -> Optional[Dict]:
     if price is None:
         return None
 
+    # Titre
     title = None
     try:
-        t_el = item.locator("h3, h2, .title, [data-testid=card-title]").first
+        t_el = item.locator("h1, h2, h3, .title, [data-testid=card-title]").first
         if await t_el.count() > 0:
             title = (await t_el.inner_text()).strip()
     except Exception:
@@ -185,37 +264,35 @@ async def extract_title_price_url(item) -> Optional[Dict]:
                       and "VENDRE"  not in l.upper()
                       and not DISPO_RE.search(l)), "Carte unique")
 
-    # détail_url candidate (utile pour la vérif)
+    # URL fiche: on privilégie explicitement /cards/
     detail_url = None
     try:
-        links = item.locator("a")
-        n = await links.count()
-        for k in range(n):
-            href = await links.nth(k).get_attribute("href")
-            if not href:
-                continue
-            low = href.lower()
-            if "foiler" in low or "disponible" in low:
-                continue
-            # on préfère les liens "cards"
-            if "cards" in low:
-                detail_url = href
+        link_cards = item.locator('a[href*="/cards/"]').first
+        if await link_cards.count() > 0:
+            href = await link_cards.get_attribute("href")
+            detail_url = abs_url(base_url, href)
+        else:
+            # fallback: premier lien "propre" non-foiler
+            links = item.locator("a")
+            n = await links.count()
+            for k in range(n):
+                href = await links.nth(k).get_attribute("href")
+                if not href:
+                    continue
+                low = href.lower()
+                if "foiler" in low or "disponible" in low:
+                    continue
+                detail_url = abs_url(base_url, href)
                 break
-            # sinon on garde le 1er lien "propre"
-            if not detail_url:
-                detail_url = href
     except Exception:
         pass
-
-    if detail_url and not detail_url.startswith("http"):
-        from urllib.parse import urljoin
-        detail_url = urljoin(TARGET_URL, detail_url)
 
     return {"title": title, "price": price, "detail_url": detail_url}
 
 # ---------- scroll + pick ----------
 async def find_first_non_foiler_with_scroll(context, page) -> Optional[Dict]:
     def build_locator():
+        # articles/tiles qui ont ACHETER + À PARTIR DE
         return page.locator("article, li, div").filter(
             has_text=re.compile(r"\bACHETER\b", re.I)
         ).filter(
@@ -284,19 +361,22 @@ async def find_first_non_foiler_with_scroll(context, page) -> Optional[Dict]:
                 seen += 1
                 continue
 
-            data = await extract_title_price_url(item)
+            data = await extract_title_price_url(TARGET_URL, item)
             seen += 1
             if not data:
                 continue
 
-            # *** Vérification détail si prix bas (p.ex. 0.23 € foiler) ***
+            # *** Vérification détail systématique si prix ≤ seuil ***
             if data["price"] <= VERIFY_BELOW_EUR:
-                ok = await verify_not_foiler_by_detail(context, data["detail_url"])
+                # Résoudre vers une vraie fiche /cards/ puis contrôler Foiler
+                card_url = await resolve_to_card_detail(context, data["detail_url"])
+                ok = await verify_not_foiler_by_detail(context, card_url)
                 if not ok:
-                    log(f"[VERIFY] {data['price']:.2f} € suspect (≤ {VERIFY_BELOW_EUR:.2f}) → détail=Foiler/indispo → ignorée.")
+                    log(f"[VERIFY] {data['price']:.2f} € ≤ {VERIFY_BELOW_EUR:.2f} → fiche=Foiler/indispo → ignorée.")
                     continue
+                # si ok, on remplace l'URL par la fiche résolue
+                data["detail_url"] = card_url
 
-            # URL finale à notifier : on utilise le détail si on l'a, sinon la liste
             url = data["detail_url"] or TARGET_URL
             log(f"[PICK] 1ʳᵉ non-Foiler: {data['price']:.2f} € — {data['title']} — {url}")
             if leading_foiler:
@@ -346,7 +426,7 @@ async def find_first_non_foiler_with_scroll(context, page) -> Optional[Dict]:
 async def main():
     global best_seen_price, best_seen_title
 
-    log("[BOOT] Altered monitor v4 (anti-Foiler vérif détail + scroll robuste + persistance)")
+    log("[BOOT] Altered monitor v5 (Foiler strict, fiche /cards/ forcée, vérif ≤ seuil, scroll robuste, persistance)")
     _load_state()
 
     if not os.path.exists(STATE_PATH):
@@ -403,6 +483,8 @@ async def main():
                         send_ifttt(title or "Carte unique", price, url)
                         best_seen_price, best_seen_title = price, title
                         _save_state()
+                    else:
+                        log(f"[INFO] Pas d'alerte: {price:.2f} € ≥ meilleur vu {best_seen_price:.2f} €")
 
             except PWTimeout:
                 log("[WARN] Timeout Playwright.")
@@ -413,7 +495,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
